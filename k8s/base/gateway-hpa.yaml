@@ -1,0 +1,54 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gateway
+  namespace: sentinel
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gateway
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    # Scale on CPU — catches general load spikes
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+
+    # Scale on memory — cognitive path buffers can be large
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+    # Scale on requests per second (requires Prometheus Adapter)
+    - type: External
+      external:
+        metric:
+          name: sentinel_requests_per_second
+          selector:
+            matchLabels:
+              app: gateway
+        target:
+          type: AverageValue
+          averageValue: "100"  # Scale up if avg pod handles >100 rps
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30    # Fast scale-up — latency-sensitive
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300   # Slow scale-down — avoid flapping
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120

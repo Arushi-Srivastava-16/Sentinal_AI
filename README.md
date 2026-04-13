@@ -1,0 +1,465 @@
+# Sentinel — AI Agent Governance Platform
+
+Real-time policy enforcement and audit layer for AI agents. Sentinel intercepts every tool call an agent makes, evaluates it against versioned policies, and produces a tamper-evident audit trail in Neo4j — in under 10ms for deterministic rules and under 500ms for LLM-evaluated decisions.
+
+```
+Agent → [sentinel-sdk] → Sentinel Gateway → Fast Path  (<10ms)  → ALLOWED / BLOCKED
+                                          ↘ Cognitive Path (<500ms) → ALLOWED / BLOCKED / HUMAN_REVIEW
+                                                    ↓
+                                              Neo4j Audit Trail
+                                                    ↓
+                                          Live React Dashboard (WebSocket)
+```
+
+---
+
+## Prerequisites
+
+| Tool | Version | Purpose |
+|------|---------|---------|
+| Docker + Docker Compose | v2.20+ | Run all services |
+| Python | 3.12+ | Run demo scripts |
+| Node.js | 20+ | Dashboard (dev mode only) |
+| `make` | any | Task runner |
+| Ollama | latest | Local LLM (Llama 3.2 3B) |
+
+---
+
+## Quick Start (5 minutes)
+
+### 1. Clone and configure
+
+```bash
+git clone https://github.com/your-org/sentinel.git
+cd sentinel
+cp .env.example .env
+# Edit .env — at minimum set:
+#   SENTINEL_ADMIN_API_KEY=snl_your_secret_admin_key_here
+#   ANTHROPIC_API_KEY=sk-ant-...   (for Tier 3 judge fallback)
+```
+
+### 2. Start the full stack
+
+```bash
+make dev-up
+# Waits for all health checks: Redis, Neo4j, Ollama, Gateway
+# Expected output: "All services healthy. Sentinel is running."
+```
+
+This starts:
+- **Redis** (ports 6379) — rate limiting, audit queue, WebSocket fan-out, judge cache
+- **Neo4j** (port 7474/7687) — audit graph database
+- **Ollama** (port 11434) — local Llama 3.2 3B judge
+- **Sentinel Gateway** (port 8000) — FastAPI governance layer
+- **Audit Worker** — Redis Streams → Neo4j consumer
+- **Dashboard** (port 3000) — React live monitoring UI
+
+### 3. Open the dashboard
+
+Navigate to [http://localhost:3000](http://localhost:3000) in your browser.
+
+You should see:
+- **Status bar** (top): green WebSocket dot, Ollama circuit breaker = CLOSED
+- **Metrics cards**: 0 total decisions, 0 blocked, 0 allowed
+- **Event feed**: empty (no agents running yet)
+- **Graph viewer**: empty canvas
+
+### 4. Run the demo scenarios
+
+Open three terminal tabs. In each, run one scenario:
+
+```bash
+# Tab 1 — Rogue Exfiltrator
+python agents/demo_a.py
+
+# Tab 2 — Rate Limit Abuser
+python agents/demo_b.py
+
+# Tab 3 — Policy Version Rollback
+python agents/demo_c.py
+```
+
+Watch the dashboard light up in real time.
+
+---
+
+## Demo Scripts
+
+### Demo A — "The Rogue Exfiltrator"
+
+**Narrative:** A financial agent tries to exfiltrate data. Sentinel catches it.
+
+```bash
+python agents/demo_a.py
+```
+
+**What happens:**
+
+| # | Tool Call | Expected | Path | Why |
+|---|-----------|----------|------|-----|
+| 1 | `read_file("/etc/passwd")` | BLOCKED | Fast | Denylist: system file access |
+| 2 | `send_email(to="rival@competitor.com", body=<PII>)` | BLOCKED | Cognitive | LLM: intent mismatch + exfiltration pattern |
+| 3 | `write_file("/tmp/export.csv")` | ALLOWED | Fast | Low-risk path, no policy violation |
+| 4 | `database_query("SELECT * FROM users")` | BLOCKED | Cognitive | LLM: PII bulk extraction |
+
+**Dashboard narration:**
+1. First event appears instantly (red BLOCKED badge) — fast path, denylist hit
+2. Third call shows green ALLOWED — watch the graph node appear linked to the agent
+3. Second and fourth calls show red after 200–500ms — cognitive path LLM evaluation
+4. Click any event in the feed to see the Neo4j graph expand
+
+---
+
+### Demo B — "The Rate Limit Abuser"
+
+**Narrative:** A web scraper fires 200 requests. Sentinel enforces per-agent quotas.
+
+```bash
+python agents/demo_b.py
+```
+
+**What happens:**
+- Calls 1–50: green ALLOWED (within 60-second burst quota)
+- Calls 51–200: red BLOCKED ("Rate limit exceeded") in <1ms each
+- Other agents running simultaneously: unaffected (per-agent isolation)
+
+**Dashboard narration:**
+1. Metrics card "Total" climbs to 200 in seconds
+2. "Blocked" card surges — ratio flip visible in donut chart
+3. Rate Limit Heatmap (bottom-left): shows the scraper agent go red
+4. Other agent rows stay green — isolation working correctly
+
+**Terminal output shows:**
+```
+[  1/ 50] web_fetch → ALLOWED     (2ms)
+[  2/ 50] web_fetch → ALLOWED     (1ms)
+...
+[ 51/200] web_fetch → BLOCKED     (0ms)  Rate limit exceeded (50/50 tokens used)
+```
+
+---
+
+### Demo C — "The Policy Version Rollback"
+
+**Narrative:** A code executor runs fine under v1. Admin deploys stricter v2. Same call changes verdict live. Admin queries which decisions would differ.
+
+```bash
+python agents/demo_c.py
+```
+
+**What happens:**
+1. Policy `financial-v1` is active
+2. `execute_code(language="python", code="...", service="payments")` → **ALLOWED** (v1 has no code restriction)
+3. Script pauses: *"Admin is activating financial-v2..."*
+4. `POST /v1/policies/financial/activate {"version": "2.0.0"}` — takes effect immediately
+5. Same `execute_code()` call → **HUMAN_REVIEW** (v2 adds human-review rule for code execution)
+6. Script prints Neo4j compliance query result: "3 decisions made under v1 would be restricted by v2"
+
+**Dashboard narration:**
+1. First execute_code appears as ALLOWED (green) with `policy_version: 1.0.0`
+2. Policy Panel (bottom-right) shows v2 now active (highlighted row)
+3. Second execute_code appears as HUMAN_REVIEW (yellow) with `policy_version: 2.0.0`
+4. Graph viewer: both Decision nodes visible, each linked to different PolicyVersion node
+5. Policy Panel: click "Show diff" to see which rules changed between v1 and v2
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Sentinel Gateway (FastAPI)               │
+│                                                             │
+│  POST /v1/tool-calls                                        │
+│    │                                                        │
+│    ├─ Auth middleware (API key validation → Redis)          │
+│    ├─ Rate limiter (token bucket Lua script → Redis DB0)    │
+│    ├─ Classifier (heuristic: fast vs cognitive)             │
+│    │                                                        │
+│    ├─ FAST PATH (p95 < 10ms)                               │
+│    │    Denylist → Allowlist → Threshold → Regex            │
+│    │    → Decision (200 sync)                               │
+│    │                                                        │
+│    └─ COGNITIVE PATH (p95 < 500ms)                         │
+│         Tier 1: Llama-3.2-3B (Ollama, 3s budget)          │
+│         Tier 3: Claude Haiku (Anthropic API, 15s budget)   │
+│         Circuit breaker: Redis-shared OPEN/CLOSED state     │
+│         → Decision (202 async + poll endpoint)             │
+│                                                             │
+│  Audit pipeline: Redis Streams → Consumer → Neo4j           │
+│  WebSocket: Redis Pub/Sub → Dashboard (fan-out)             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Redis Database Layout
+
+| DB | Purpose | Key Pattern | Eviction |
+|----|---------|-------------|---------|
+| 0 | Rate limiting | `{tenant}:rate:{agent_id}:{window}` | volatile-ttl |
+| 1 | Audit stream | `sentinel:audit:events` (Stream) | noeviction |
+| 2 | WebSocket fan-out | `sentinel:dashboard:events` (Pub/Sub) | allkeys-lru |
+| 3 | Judge cache | `judge:cache:{sha256}` | allkeys-lru |
+
+### Neo4j Graph Schema
+
+```cypher
+(:Agent)-[:INITIATED]->(:Session)
+(:Session)-[:CONTAINS]->(:ToolCall)
+(:ToolCall)-[:RESULTED_IN]->(:Decision)
+(:Decision)-[:EVALUATED_UNDER]->(:PolicyVersion)
+(:Decision)-[:TRIGGERED_RULE]->(:Rule)
+(:Decision)-[:JUDGED_BY]->(:JudgeTier)
+(:ToolCall)-[:FOLLOWS]->(:ToolCall)   // temporal chain
+```
+
+**Compliance queries** (run in Neo4j Browser at http://localhost:7474):
+
+```cypher
+-- Which v1-ALLOWED decisions would v2 block?
+MATCH (d:Decision)-[:EVALUATED_UNDER]->(pv:PolicyVersion {version: "1.0.0"})
+WHERE d.verdict = "allowed"
+MATCH (d)-[:TRIGGERED_RULE]->(r:Rule)
+WHERE NOT EXISTS {
+  MATCH (r2:Rule)<-[:CONTAINS]-(:PolicyVersion {version: "2.0.0"})
+  WHERE r2.name = r.name
+}
+RETURN d.id, d.verdict, r.name, d.timestamp_ns
+ORDER BY d.timestamp_ns DESC;
+
+-- All tool calls by a specific agent in the last hour
+MATCH (a:Agent {id: "agent_abc"})-[:INITIATED]->(:Session)-[:CONTAINS]->(tc:ToolCall)
+WHERE tc.timestamp_ns > (timestamp() - 3600000) * 1000000
+MATCH (tc)-[:RESULTED_IN]->(d:Decision)
+RETURN tc.tool_name, d.verdict, d.latency_ms, d.timestamp_ns
+ORDER BY tc.timestamp_ns DESC;
+```
+
+---
+
+## API Reference
+
+Full interactive docs: [http://localhost:8000/docs](http://localhost:8000/docs)
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/v1/tool-calls` | POST | Agent key | Submit a tool call for evaluation |
+| `/v1/decisions/{id}` | GET | Agent key | Poll for async cognitive path result |
+| `/v1/agents` | POST | Admin key | Register a new agent, get API key |
+| `/v1/agents/{id}` | GET | Admin key | Get agent info |
+| `/v1/policies` | GET | Admin key | List all policy versions |
+| `/v1/policies/{group}/activate` | POST | Admin key | Activate a policy version (live) |
+| `/ws/dashboard` | WS | Agent key (query param) | Live event stream |
+| `/health` | GET | None | Service health (Redis, Neo4j, Ollama) |
+| `/metrics` | GET | None | Prometheus metrics |
+
+### Tool Call Request
+
+```json
+{
+  "tool_name": "execute_payment",
+  "arguments": {
+    "amount": 75000,
+    "currency": "USD",
+    "recipient": "vendor_abc"
+  },
+  "context": {
+    "task_description": "Pay Q1 invoice per clause 4.2",
+    "conversation_history": [],
+    "source_documents": ["contract_q1.pdf"]
+  }
+}
+```
+
+### Decision Response (200 sync)
+
+```json
+{
+  "decision_id": "dec_a1b2c3",
+  "verdict": "blocked",
+  "reason": "Payment amount $75,000 exceeds policy threshold of $10,000 without explicit authorization.",
+  "path": "cognitive_path",
+  "latency_ms": 312.4,
+  "policy_version": "financial-1.0.0",
+  "confidence": 0.94,
+  "rate_limit": {
+    "tokens_remaining": 47,
+    "reset_at": 1709123456
+  }
+}
+```
+
+---
+
+## SDK Usage
+
+```python
+import asyncio
+from sentinel_sdk.client import AgentClient
+
+async def main():
+    async with AgentClient(
+        gateway_url="http://localhost:8000",
+        api_key="snl_your_agent_key",
+        agent_id="agent_abc",
+    ) as sentinel:
+        decision = await sentinel.check(
+            tool_name="execute_payment",
+            arguments={"amount": 75000, "currency": "USD", "recipient": "vendor_abc"},
+            context={"task_description": "Pay Q1 invoice per clause 4.2"},
+        )
+        if decision.is_allowed:
+            # Execute the tool
+            result = execute_payment(amount=75000, currency="USD", recipient="vendor_abc")
+        else:
+            raise BlockedBySentinel(decision.reason)
+
+asyncio.run(main())
+```
+
+---
+
+## Development
+
+### Run tests
+
+```bash
+# Unit tests (no Docker needed)
+make test-unit
+
+# Integration tests (requires Redis + Neo4j via Docker)
+make test-integration
+
+# E2E tests (requires full stack running)
+make dev-up
+make test-e2e
+```
+
+### Project structure
+
+```
+sentinel/
+├── gateway/              # FastAPI governance layer
+│   ├── auth/             # API key + JWT handling
+│   ├── classifier/       # Heuristic fast/cognitive router
+│   ├── cognitive_path/   # Async decision handler
+│   ├── fast_path/        # Denylist, allowlist, rate limiter
+│   ├── middleware/        # Auth middleware, AgentContext
+│   ├── models/           # Pydantic request/response models
+│   ├── routes/           # HTTP + WebSocket route handlers
+│   └── websocket/        # ConnectionManager, Redis Pub/Sub bridge
+├── judge/                # LLM judge cascade
+│   ├── prompts/          # Jinja2 templates (intent, faithfulness)
+│   ├── tier1.py          # Llama-3.2-3B (Ollama)
+│   ├── tier3.py          # Claude Haiku (Anthropic API)
+│   ├── cascade.py        # Tier selection logic + fallback
+│   └── circuit_breaker.py # Redis-backed OPEN/CLOSED state
+├── database/             # Neo4j audit pipeline
+│   ├── audit_writer.py   # Cypher write logic
+│   ├── stream_writer.py  # Redis Streams producer
+│   └── stream_consumer.py # Consumer worker (runs as separate service)
+├── policies/             # Versioned YAML policy files
+│   ├── schema.yaml       # JSON Schema for policy documents
+│   ├── loader.py         # Active version resolution (Redis-backed)
+│   ├── engine.py         # Rule evaluation
+│   └── examples/         # financial-v1.yaml, financial-v2.yaml
+├── shared/               # Redis + Neo4j client factories
+├── sentinel-sdk/         # Agent-side SDK (thin httpx wrapper)
+├── agents/               # Demo scripts (demo_a.py, demo_b.py, demo_c.py)
+├── dashboard/            # React + TypeScript dashboard
+│   └── src/
+│       ├── components/   # EventFeed, GraphViewer, PolicyPanel, ...
+│       ├── hooks/        # useWebSocket, useDecisions
+│       └── store/        # Zustand event store (500-event ring buffer)
+├── tests/
+│   ├── unit/             # Pure function tests (fakeredis, no I/O)
+│   ├── integration/      # testcontainers-based (Redis + Neo4j)
+│   └── e2e/              # Full stack tests (docker-compose)
+├── docker-compose.yml    # Full production-like stack
+├── docker-compose.dev.yml # Infra only (Redis, Neo4j, Ollama)
+├── Makefile              # All common tasks
+└── .env.example          # All environment variables documented
+```
+
+### Makefile targets
+
+```bash
+make dev-up           # Start infra + app services, wait for health
+make dev-down         # Stop and remove all containers
+make test             # Run all tests
+make test-unit        # Unit tests only (fast, no Docker)
+make test-integration # Integration tests (Docker required)
+make test-e2e         # E2E tests against live stack
+make lint             # ruff check + mypy
+make format           # ruff format
+make demo-a           # Run Rogue Exfiltrator scenario
+make demo-b           # Run Rate Limit Abuser scenario
+make demo-c           # Run Policy Rollback scenario
+make logs-gateway     # Tail gateway logs
+make neo4j-browser    # Open Neo4j browser in default browser
+```
+
+---
+
+## Configuration
+
+All settings are environment variables (see `.env.example`):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SENTINEL_ADMIN_API_KEY` | — | Admin API key (required) |
+| `ANTHROPIC_API_KEY` | — | Claude Haiku fallback (optional but recommended) |
+| `SENTINEL_GATEWAY_ENV` | `development` | `development` / `production` |
+| `SENTINEL_RATE_LIMIT_REQUESTS` | `50` | Burst quota per agent per window |
+| `SENTINEL_RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate limit window duration |
+| `SENTINEL_COGNITIVE_TIMEOUT_SECONDS` | `20` | Max wait for LLM judge |
+| `OLLAMA_BASE_URL` | `http://ollama:11434` | Ollama endpoint |
+| `OLLAMA_MODEL` | `llama3.2:3b` | Judge model |
+| `REDIS_URL` | `redis://redis:6379` | Redis connection |
+| `NEO4J_URI` | `bolt://neo4j:7687` | Neo4j connection |
+| `SENTINEL_GATEWAY_CORS_ORIGINS` | `["http://localhost:3000"]` | Allowed dashboard origins |
+
+---
+
+## Troubleshooting
+
+**Gateway won't start:**
+```bash
+make dev-down && make dev-up   # Clean restart
+docker logs sentinel-gateway   # Check for missing env vars
+```
+
+**Ollama not loading the model:**
+```bash
+docker exec -it sentinel-ollama ollama pull llama3.2:3b
+```
+
+**Neo4j Browser shows no data after demo:**
+```bash
+# Check audit worker is running
+docker logs sentinel-audit-worker
+# Check Redis stream depth
+docker exec sentinel-redis redis-cli XLEN sentinel:audit:events
+```
+
+**Dashboard shows "WS Disconnected":**
+- Verify gateway is running: `curl http://localhost:8000/health`
+- Check CORS: `SENTINEL_GATEWAY_CORS_ORIGINS` must include `http://localhost:3000`
+- Check API key in dashboard settings matches a registered agent or admin key
+
+**Circuit breaker OPEN (Ollama down):**
+- All cognitive-path decisions return `HUMAN_REVIEW` immediately
+- Dashboard status bar shows red circuit breaker badge
+- Fix: `docker restart sentinel-ollama` then wait 30s for HALF_OPEN → CLOSED
+
+---
+
+## Roadmap
+
+- **Phase 4 (in progress):** Prometheus metrics, Grafana dashboards, Locust load tests, Kubernetes manifests, mTLS
+- **Future:** Multi-tenancy UI, SAML SSO, webhook callbacks, Slack/PagerDuty alerting, policy-as-code CLI
+
+---
+
+## License
+
+MIT

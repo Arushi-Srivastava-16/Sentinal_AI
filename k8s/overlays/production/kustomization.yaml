@@ -1,0 +1,37 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+bases:
+  - ../../base
+
+namespace: sentinel
+
+# Scale up for production
+patches:
+  - patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3
+    target:
+      kind: Deployment
+      name: gateway
+  - patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3
+    target:
+      kind: Deployment
+      name: audit-worker
+
+images:
+  - name: ghcr.io/your-org/sentinel-gateway
+    newTag: "1.0.0"
+  - name: ghcr.io/your-org/sentinel-dashboard
+    newTag: "1.0.0"
+
+configMapGenerator:
+  - name: sentinel-config
+    literals:
+      - SENTINEL_GATEWAY_ENV=production
+      - SENTINEL_RATE_LIMIT_REQUESTS=100
+      - SENTINEL_RATE_LIMIT_WINDOW_SECONDS=60

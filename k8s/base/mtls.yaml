@@ -1,0 +1,185 @@
+# =============================================================================
+# mTLS configuration for Sentinel
+#
+# Uses cert-manager (https://cert-manager.io) for certificate lifecycle.
+#
+# Prerequisites:
+#   kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.yaml
+#   # Wait for cert-manager to be ready:
+#   kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=cert-manager -n cert-manager --timeout=120s
+#
+# For production mTLS between gateway pods:
+#   1. Apply this file to create the CA and Issuer
+#   2. Apply agent-certificate-template.yaml for each agent
+#   3. Agents present client certs; gateway validates via trust-manager
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. Self-signed CA for Sentinel internal PKI
+# ---------------------------------------------------------------------------
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: sentinel-selfsigned-issuer
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: sentinel-ca
+  namespace: sentinel
+spec:
+  isCA: true
+  commonName: sentinel-ca
+  subject:
+    organizations: ["Sentinel AI"]
+  secretName: sentinel-ca-secret
+  duration: 87600h  # 10 years
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 384
+  issuerRef:
+    name: sentinel-selfsigned-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+# Internal CA issuer (signs gateway + agent certs)
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: sentinel-ca-issuer
+  namespace: sentinel
+spec:
+  ca:
+    secretName: sentinel-ca-secret
+
+# ---------------------------------------------------------------------------
+# 2. Let's Encrypt issuer (public TLS for ingress)
+# ---------------------------------------------------------------------------
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: ops@your-domain.com   # REPLACE with real email
+    privateKeySecretRef:
+      name: letsencrypt-prod-key
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+
+# ---------------------------------------------------------------------------
+# 3. Gateway server certificate (internal service mesh)
+# ---------------------------------------------------------------------------
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: sentinel-gateway-cert
+  namespace: sentinel
+spec:
+  secretName: sentinel-gateway-tls
+  commonName: gateway.sentinel.svc.cluster.local
+  dnsNames:
+    - gateway.sentinel.svc.cluster.local
+    - gateway.sentinel.svc
+    - gateway
+  duration: 8760h   # 1 year
+  renewBefore: 720h # Renew 30 days before expiry
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+    - client auth
+  issuerRef:
+    name: sentinel-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+
+# ---------------------------------------------------------------------------
+# 4. NetworkPolicy — only allow traffic from within the sentinel namespace
+# ---------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-ingress
+  namespace: sentinel
+spec:
+  podSelector:
+    matchLabels:
+      app: gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow from ingress controller
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8000
+    # Allow from audit-worker (health checks)
+    - from:
+        - podSelector:
+            matchLabels:
+              app: audit-worker
+      ports:
+        - protocol: TCP
+          port: 8000
+    # Allow from Prometheus scraper
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: sentinel
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  # Default deny — whitelisted above per-service
+
+# ---------------------------------------------------------------------------
+# 5. PodDisruptionBudget — maintain availability during node drains
+# ---------------------------------------------------------------------------
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway-pdb
+  namespace: sentinel
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: gateway
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: audit-worker-pdb
+  namespace: sentinel
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: audit-worker

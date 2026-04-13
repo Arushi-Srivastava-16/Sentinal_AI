@@ -1,0 +1,135 @@
+# =============================================================================
+# Sentinel Policy — Financial v2.0.0
+# Supersedes: financial-v1 (1.0.0)
+# Change summary: code_execution now requires human_review (breaking change)
+# =============================================================================
+
+id: financial-v1
+version: "2.0.0"
+policy_group: financial
+effective_from: "2026-03-01T00:00:00Z"
+effective_until: null
+parent_version: "1.0.0"
+description: >
+  Financial policy v2. Adds: code execution requires human review.
+  Used in Demo Scenario C to demonstrate live policy version rollback.
+
+rate_limits:
+  tokens_per_minute: 30
+  bucket_size: 30
+  burst_multiplier: 1.0
+
+rules:
+
+  # Inherits all v1 rules plus the addition below.
+
+  - id: rule-path-traversal-denylist
+    description: Block read_file calls to sensitive system paths
+    severity: critical
+    type: denylist
+    applies_to_tools: [read_file]
+    action: block
+    config:
+      argument_key: path
+      match_mode: prefix
+      patterns:
+        - "/etc/"
+        - "/proc/"
+        - "/sys/"
+        - "/root/"
+        - "/var/shadow"
+        - "C:\\Windows\\System32"
+
+  - id: rule-email-denylist
+    description: Block outbound email to known exfiltration targets
+    severity: high
+    type: denylist
+    applies_to_tools: [send_email]
+    action: block
+    config:
+      argument_key: to
+      match_mode: contains
+      patterns:
+        - "admin@"
+        - "root@"
+        - "@malicious"
+        - "@competitor"
+
+  - id: rule-max-payment-amount
+    description: Block payments exceeding $100,000 USD
+    severity: high
+    type: threshold
+    applies_to_tools: [execute_payment]
+    action: block
+    config:
+      argument_key: amount
+      max_value: 100000
+      currency_argument: currency
+
+  - id: rule-payment-currency-allowlist
+    description: Only allow payments in USD, EUR, GBP
+    severity: medium
+    type: allowlist
+    applies_to_tools: [execute_payment]
+    action: block
+    config:
+      argument_key: currency
+      patterns: [USD, EUR, GBP]
+
+  - id: rule-pii-query-regex
+    description: Flag SQL queries that access user/customer PII tables
+    severity: high
+    type: regex
+    applies_to_tools: [database_query, execute_sql]
+    action: cognitive_check
+    config:
+      argument_key: query
+      pattern: "(?i)SELECT.*(FROM\\s+(users|customers|accounts|pii|personal))"
+
+  - id: rule-high-value-payment-cognitive
+    description: Payments over $10,000 require LLM judge faithfulness + intent check.
+    severity: high
+    type: cognitive
+    applies_to_tools: [execute_payment]
+    action: cognitive_check
+    config:
+      check_types: [faithfulness, intent]
+      min_confidence: 0.80
+      trigger_condition:
+        argument_key: amount
+        min_value: 10000
+
+  - id: rule-bulk-export-human-review
+    description: CSV/JSON write_file calls flagged for human review.
+    severity: medium
+    type: regex
+    applies_to_tools: [write_file]
+    action: human_review
+    config:
+      argument_key: path
+      pattern: "(?i)\\.(csv|json|xlsx|parquet)$"
+
+  - id: rule-prompt-injection-reasoning
+    description: Block requests with prompt injection patterns in task_description.
+    severity: critical
+    type: regex
+    applies_to_tools: []
+    action: block
+    config:
+      argument_key: "__context.task_description"
+      pattern: "(?i)(ignore (all |previous |prior )?(rules|instructions|constraints)|disregard|jailbreak|DAN mode)"
+
+  # ---------------------------------------------------------------------------
+  # NEW in v2: Code execution requires human review
+  # ---------------------------------------------------------------------------
+  - id: rule-code-execution-human-review
+    description: >
+      v2 BREAKING CHANGE: All execute_code calls now require human review.
+      Previously allowed under v1. Demonstrates policy rollback in Demo C.
+    severity: high
+    type: allowlist
+    applies_to_tools: [execute_code]
+    action: human_review
+    config:
+      argument_key: "__always_match"
+      patterns: []   # empty allowlist = always triggers
