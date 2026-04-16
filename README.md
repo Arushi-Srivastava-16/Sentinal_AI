@@ -1,6 +1,24 @@
+<div align="center">
+
 # Sentinel — AI Agent Governance Platform
 
-Real-time policy enforcement and audit layer for AI agents. Sentinel intercepts every tool call an agent makes, evaluates it against versioned policies, and produces a tamper-evident audit trail in Neo4j — in under 10ms for deterministic rules and under 500ms for LLM-evaluated decisions.
+**Real-time policy enforcement and audit layer for AI agents. Intercepts every tool call, evaluates it against versioned policies, and produces a tamper-evident audit trail — in under 10ms for deterministic rules, under 500ms for LLM-evaluated decisions.**
+
+[![Python](https://img.shields.io/badge/Python-3.12%2B-blue?style=flat-square&logo=python)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.104%2B-009688?style=flat-square&logo=fastapi)](https://fastapi.tiangolo.com/)
+[![Neo4j](https://img.shields.io/badge/Neo4j-Audit%20Graph-008CC1?style=flat-square&logo=neo4j)](https://neo4j.com/)
+[![Redis](https://img.shields.io/badge/Redis-Rate%20Limiting-DC382D?style=flat-square&logo=redis)](https://redis.io/)
+[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=flat-square&logo=docker)](https://docker.com/)
+[![React](https://img.shields.io/badge/React-Dashboard-61DAFB?style=flat-square&logo=react)](https://react.dev/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
+
+[**Quick Start**](#quick-start-5-minutes) · [**Architecture**](#architecture) · [**Demo Scenarios**](#demo-scripts) · [**API Reference**](#api-reference) · [**SDK**](#sdk-usage)
+
+</div>
+
+---
+
+## How It Works
 
 ```
 Agent → [sentinel-sdk] → Sentinel Gateway → Fast Path  (<10ms)  → ALLOWED / BLOCKED
